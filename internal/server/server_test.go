@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -3604,6 +3605,27 @@ func TestHandleEvents_MethodNotAllowed(t *testing.T) {
 	}
 }
 
+func TestHandleEvents_ReturnsAfterServerShutdown(t *testing.T) {
+	srv, session := newTestServer(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/events", nil)
+	w := newNotifyingResponseRecorder()
+	done := make(chan struct{})
+	go func() {
+		srv.ServeHTTP(w, req)
+		close(done)
+	}()
+
+	waitForSubscriberCount(t, session, 1)
+	session.Notify(SSEEvent{Type: "server-shutdown"})
+	w.waitForWrite(t, "event: server-shutdown")
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("SSE handler kept the stream open after server-shutdown")
+	}
+}
+
 func TestHandleEvents_SSEHeaders(t *testing.T) {
 	srv, session := newTestServer(t)
 
@@ -4132,6 +4154,47 @@ func TestHandleHealth_MethodNotAllowed(t *testing.T) {
 	srv.ServeHTTP(w, req)
 	if w.Code != 405 {
 		t.Errorf("status = %d, want 405", w.Code)
+	}
+}
+
+// flushOrderRecorder records whether the response was flushed before any
+// event reached the subscribed channel.
+type flushOrderRecorder struct {
+	*httptest.ResponseRecorder
+	events             chan SSEEvent
+	flushedBeforeEvent bool
+}
+
+func (r *flushOrderRecorder) Flush() {
+	if len(r.events) == 0 {
+		r.flushedBeforeEvent = true
+	}
+	r.ResponseRecorder.Flush()
+}
+
+func TestHandleFinish_ResponseCompleteBeforeFinishEvent(t *testing.T) {
+	srv, sess := newTestServer(t)
+	ch := sess.Subscribe()
+	defer sess.Unsubscribe(ch)
+
+	w := &flushOrderRecorder{ResponseRecorder: httptest.NewRecorder(), events: ch}
+	srv.ServeHTTP(w, httptest.NewRequest("POST", "/api/finish", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if !w.flushedBeforeEvent {
+		t.Error("the finish response must be flushed before the finish event, which may stop the daemon")
+	}
+	if got, want := w.Header().Get("Content-Length"), strconv.Itoa(w.Body.Len()); got != want {
+		t.Errorf("Content-Length = %q, want %q so the response is complete on its own", got, want)
+	}
+	select {
+	case ev := <-ch:
+		if ev.Type != "finish" {
+			t.Errorf("event = %q, want finish", ev.Type)
+		}
+	default:
+		t.Error("no finish event was sent")
 	}
 }
 

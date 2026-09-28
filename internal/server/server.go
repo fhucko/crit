@@ -2501,7 +2501,9 @@ func (s *Server) handleFinish(w http.ResponseWriter, r *http.Request) {
 	if ms, enabled := s.cfg.CloseOnApproveAfterMsEnabled(); enabled {
 		finishResp["close_on_approve_after_ms"] = ms
 	}
-	writeJSON(w, finishResp)
+	// The finish event below lets a waiting client stop the daemon at once, so
+	// the browser's response must be complete on the wire before it is sent.
+	writeJSONComplete(w, finishResp)
 
 	// Encode approved status into SSE event content as JSON so review-cycle
 	// clients can extract it without string matching on the prompt.
@@ -2756,6 +2758,11 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			data, _ := json.Marshal(event)
 			fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event.Type, data)
 			flusher.Flush()
+			// server-shutdown is the last event; returning lets the HTTP
+			// server finish shutting down instead of waiting for the client.
+			if event.Type == "server-shutdown" {
+				return
+			}
 		}
 	}
 }
@@ -3431,6 +3438,22 @@ func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(v); err != nil {
 		log.Printf("writeJSON: encode error: %v", err)
+	}
+}
+
+// writeJSONComplete writes v with a Content-Length and flushes it, so the
+// response is fully delivered even if the process ends right afterwards.
+func writeJSONComplete(w http.ResponseWriter, v any) {
+	var body bytes.Buffer
+	if err := json.NewEncoder(&body).Encode(v); err != nil {
+		log.Printf("writeJSONComplete: encode error: %v", err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Length", strconv.Itoa(body.Len()))
+	_, _ = w.Write(body.Bytes())
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
 	}
 }
 
