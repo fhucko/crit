@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"bufio"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -12,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -577,44 +579,140 @@ func DaemonHasBrowser(s SessionEntry) bool {
 // acquireSessionLock tries to acquire a file-based lock for a session key using flock().
 // Returns the lock file handle on success. The caller must call releaseSessionLock.
 // flock is automatically released when the process dies, preventing stale locks.
-// Uses exponential backoff starting at 100ms, doubling up to 500ms.
+// Gives up after 5 seconds.
 func acquireSessionLock(key string) (*os.File, error) {
 	dir, err := sessionsDir()
 	if err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(dir, 0700); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	f, err := lockFile(ctx, filepath.Join(dir, key+".lock"))
+	if err != nil {
+		return nil, fmt.Errorf("could not acquire session lock for %s: %w", key, err)
+	}
+	return f, nil
+}
+
+// lockFile opens the lock file at path, creating it if needed, and polls
+// until this process holds it or ctx is done. A file removed while this
+// process waited for it excludes nobody, so it is opened again.
+func lockFile(ctx context.Context, path string) (*os.File, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return nil, fmt.Errorf("creating sessions directory: %w", err)
 	}
-	lockPath := filepath.Join(dir, key+".lock")
+	for {
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			return nil, err
+		}
+		for err = flockExclusiveNB(f); err != nil && lockHeld(err); err = flockExclusiveNB(f) {
+			select {
+			case <-ctx.Done():
+				f.Close()
+				return nil, ctx.Err()
+			case <-time.After(100 * time.Millisecond):
+			}
+		}
+		if err != nil {
+			f.Close()
+			return nil, err
+		}
+		if isFileAt(f, path) {
+			return f, nil
+		}
+		f.Close()
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+	}
+}
 
-	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_WRONLY, 0644)
+// isFileAt reports whether f is still the file at path.
+func isFileAt(f *os.File, path string) bool {
+	held, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	current, err := os.Stat(path)
+	return err == nil && os.SameFile(held, current)
+}
+
+// removeLockFile deletes a lock file this process holds. Unix has to unlink
+// it before letting go of the lock, or a waiter could lock it just before it
+// goes. Windows cannot delete an open file, so it lets go first, and the
+// delete then fails harmlessly if another process has opened the file since.
+func removeLockFile(f *os.File, path string) {
+	if runtime.GOOS == "windows" {
+		f.Close()
+		os.Remove(path)
+		return
+	}
+	os.Remove(path)
+	f.Close()
+}
+
+// removeLockIfFree deletes the lock file at path unless another process
+// holds it.
+func removeLockIfFree(path string) {
+	f, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if err != nil {
+		return
+	}
+	if flockExclusiveNB(f) != nil {
+		f.Close()
+		return
+	}
+	removeLockFile(f, path)
+}
+
+// reviewLockPath is the lock file a daemon holds while it has key's review
+// loaded.
+func reviewLockPath(key string) (string, error) {
+	dir, err := sessionsDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, key+".review.lock"), nil
+}
+
+// AcquireReviewLock waits until this process holds key's review lock. A
+// daemon takes it before it loads the review and keeps it until it exits, so
+// a daemon started while another one under the same key is still stopping
+// reads the review only after that one's last write. It gives up once ctx is
+// done.
+func AcquireReviewLock(ctx context.Context, key string) (*os.File, error) {
+	path, err := reviewLockPath(key)
 	if err != nil {
 		return nil, err
 	}
-
-	deadline := time.Now().Add(5 * time.Second)
-	backoff := 100 * time.Millisecond
-	for time.Now().Before(deadline) {
-		err = flockExclusiveNB(f)
-		if err == nil {
-			return f, nil
-		}
-		time.Sleep(backoff)
-		if backoff < 500*time.Millisecond {
-			backoff *= 2
-		}
+	f, err := lockFile(ctx, path)
+	if err != nil && ctx.Err() != nil {
+		return nil, fmt.Errorf("waiting for the review of session %s, held by another crit daemon: %w", key, err)
 	}
-	f.Close()
-	return nil, fmt.Errorf("could not acquire session lock for %s", key)
+	if err != nil {
+		return nil, fmt.Errorf("locking the review of session %s: %w", key, err)
+	}
+	return f, nil
+}
+
+// WithReviewLock runs fn while holding key's review lock, so that no daemon
+// has the review loaded meanwhile. It skips fn when the lock is still held
+// after wait.
+func WithReviewLock(key string, wait time.Duration, fn func()) {
+	ctx, cancel := context.WithTimeout(context.Background(), wait)
+	defer cancel()
+	f, err := AcquireReviewLock(ctx, key)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	fn()
 }
 
 // releaseSessionLock unlocks, closes, and removes the lock file.
 func releaseSessionLock(f *os.File) {
-	_ = Funlock(f)
-	name := f.Name()
-	f.Close()
-	os.Remove(name)
+	removeLockFile(f, f.Name())
 }
 
 // setupDaemonCmd creates and configures the daemon child process.
@@ -989,22 +1087,6 @@ func SessionOwnedBy(key string, pid int) bool {
 	return err == nil && entry.PID == pid
 }
 
-// UnlessSessionTakenOver runs fn under key's session lock unless another
-// daemon has registered under key. A starting daemon's client holds that lock
-// until the daemon has registered, so none can take the key over while fn
-// runs.
-func UnlessSessionTakenOver(key string, pid int, fn func()) {
-	lock, err := acquireSessionLock(key)
-	if err != nil {
-		return
-	}
-	defer releaseSessionLock(lock)
-	if entry, err := ReadSessionFile(key); err == nil && entry.PID != pid {
-		return
-	}
-	fn()
-}
-
 // waitForExit polls until proc has exited or timeout elapses, and reports
 // whether it exited.
 func waitForExit(proc *os.Process, timeout time.Duration) bool {
@@ -1106,7 +1188,12 @@ func cleanOrphanedSessions() {
 			os.Remove(path)
 			key := strings.TrimSuffix(de.Name(), ".json")
 			os.Remove(filepath.Join(sessDir, key+".log"))
-			os.Remove(filepath.Join(sessDir, key+".lock"))
+			removeLockIfFree(filepath.Join(sessDir, key+".lock"))
+		}
+	}
+	for _, de := range entries {
+		if strings.HasSuffix(de.Name(), ".review.lock") {
+			removeLockIfFree(filepath.Join(sessDir, de.Name()))
 		}
 	}
 }

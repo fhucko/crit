@@ -353,7 +353,7 @@ When the agent runs `crit` again (or calls `POST /api/round-complete`):
 3. **`crit plan.md`**: looks up daemon by hash(cwd + "plan.md") — reuses if alive, starts new if dead
 4. **Ctrl+C**: kills the daemon the client started
 5. **`crit stop`**: stops daemon for current cwd; `crit stop --all` stops every daemon. Both ask for a graceful stop via `POST /api/shutdown` first and fall back to signals
-6. **Approve**: the approving client asks for `POST /api/shutdown`, waits for the daemon to exit, and only then applies `cleanup_on_approve`, under the session lock and only if no other daemon took the key over. A stopping daemon can still write the review, so never remove it earlier
+6. **Approve**: the approving client asks for `POST /api/shutdown`, waits for the daemon to exit, and only then applies `cleanup_on_approve`, while holding the review lock. A stopping daemon can still write the review, so never remove it earlier
 7. **Lifetime**: daemon runs until approved or killed (Ctrl+C, `crit stop`, or SIGINT/SIGTERM/SIGHUP). No idle timeout — walking away from a review session is fine.
 
 ### Deferred initialization & readiness
@@ -369,6 +369,8 @@ Daemon state in `~/.crit/sessions/`, one file per session.
 - File mode (args present): `sha256(cwd + "\0" + args...)[:12]` (branch excluded — file reviews aren't branch-dependent)
 
 Session file: `{"pid", "port", "cwd", "args", "branch", "review_path", "started_at"}`. Review data lives at `~/.crit/reviews/<key>.json` (same key).
+
+A daemon holds `<key>.review.lock` from before it loads the review until it exits, although it removes its session file as soon as it starts stopping. A daemon started under the same key meanwhile therefore waits (503 while it initialises) and reads the review only after the last write. Lock files (`.lock`, `.review.lock`) are deleted only by a process that holds them (`removeLockFile`), and `lockFile` reopens a file deleted while it waited, so two processes never hold the same lock.
 
 `crit _serve` runs the server in foreground (used by daemon spawning, not user-facing).
 

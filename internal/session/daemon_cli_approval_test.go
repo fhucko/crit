@@ -1,6 +1,7 @@
 package session
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -9,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/tomasz-tomczyk/crit/internal/daemon"
 	"github.com/tomasz-tomczyk/crit/internal/testutil"
@@ -17,21 +19,23 @@ import (
 func TestStopDaemonOnApproval(t *testing.T) {
 	const noSessionFile = 0
 	tests := []struct {
-		name                string
-		approved            bool
-		cleanup             bool
-		shutdownCode        int // HTTP status the daemon answers /api/shutdown with
-		sessionPID          int
-		successorDuringWait bool // a daemon registers under the key while this one exits
-		wantRequest         bool
-		wantSignal          bool
-		wantWaited          bool
-		wantRemoved         bool
+		name             string
+		approved         bool
+		cleanup          bool
+		shutdownCode     int // HTTP status the daemon answers /api/shutdown with
+		sessionPID       int
+		startedMeanwhile bool // a daemon started under the key while this one exited holds the review
+		olderMeanwhile   bool // an older crit, which takes no review lock, registered under the key meanwhile
+		wantRequest      bool
+		wantSignal       bool
+		wantWaited       bool
+		wantRemoved      bool
 	}{
 		{name: "not approved", approved: false, cleanup: true, shutdownCode: http.StatusOK, sessionPID: os.Getpid()},
 		{name: "daemon accepts", approved: true, cleanup: true, shutdownCode: http.StatusOK, sessionPID: os.Getpid(), wantRequest: true, wantWaited: true, wantRemoved: true},
 		{name: "daemon accepts, cleanup_on_approve off", approved: true, shutdownCode: http.StatusOK, sessionPID: os.Getpid(), wantRequest: true},
-		{name: "successor registers while the daemon exits", approved: true, cleanup: true, shutdownCode: http.StatusOK, sessionPID: os.Getpid(), successorDuringWait: true, wantRequest: true, wantWaited: true},
+		{name: "a daemon started meanwhile holds the review", approved: true, cleanup: true, shutdownCode: http.StatusOK, sessionPID: os.Getpid(), startedMeanwhile: true, wantRequest: true, wantWaited: true},
+		{name: "an older crit started meanwhile", approved: true, cleanup: true, shutdownCode: http.StatusOK, sessionPID: os.Getpid(), olderMeanwhile: true, wantRequest: true, wantWaited: true},
 		{name: "another daemon on the port", approved: true, cleanup: true, shutdownCode: http.StatusConflict, sessionPID: os.Getpid(), wantRequest: true},
 		{name: "daemon already shutting down for another client", approved: true, cleanup: true, shutdownCode: http.StatusNotFound, sessionPID: noSessionFile, wantRequest: true, wantWaited: true, wantRemoved: true},
 		{name: "session replaced by a newer daemon", approved: true, cleanup: true, shutdownCode: http.StatusNotFound, sessionPID: os.Getpid() + 1, wantRequest: true},
@@ -75,20 +79,27 @@ func TestStopDaemonOnApproval(t *testing.T) {
 			}
 
 			signalled, waited := false, false
-			origTerminate, origWait, origGrace := terminateDaemonProcess, waitForDaemonExit, approvalSignalGrace
+			origTerminate, origWait, origGrace, origLockWait := terminateDaemonProcess, waitForDaemonExit, approvalSignalGrace, reviewLockWait
 			terminateDaemonProcess = func(*os.Process) error { signalled = true; return nil }
 			waitForDaemonExit = func(int) {
 				waited = true
 				if _, err := os.Stat(reviewPath); err != nil {
 					t.Error("the review was removed before the daemon exited")
 				}
-				if tt.successorDuringWait {
+				if tt.startedMeanwhile {
+					lock, err := daemon.AcquireReviewLock(context.Background(), key)
+					if err != nil {
+						t.Fatalf("AcquireReviewLock: %v", err)
+					}
+					t.Cleanup(func() { lock.Close() })
+				}
+				if tt.olderMeanwhile {
 					writeSession(os.Getpid() + 1)
 				}
 			}
-			approvalSignalGrace = 0
+			approvalSignalGrace, reviewLockWait = 0, 100*time.Millisecond
 			t.Cleanup(func() {
-				terminateDaemonProcess, waitForDaemonExit, approvalSignalGrace = origTerminate, origWait, origGrace
+				terminateDaemonProcess, waitForDaemonExit, approvalSignalGrace, reviewLockWait = origTerminate, origWait, origGrace, origLockWait
 			})
 
 			stopDaemonOnApproval(tt.approved, entry, key, tt.cleanup)

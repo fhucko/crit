@@ -1,12 +1,17 @@
 package main
 
 import (
+	"context"
 	"errors"
+	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/tomasz-tomczyk/crit/internal/daemon"
 	"github.com/tomasz-tomczyk/crit/internal/server"
 	"github.com/tomasz-tomczyk/crit/internal/testutil"
 )
@@ -212,5 +217,104 @@ func TestServeSessionKey_Override(t *testing.T) {
 	sc := &server.DaemonCLIConfig{SessionKeyOverride: "839f3b4cd5d6"}
 	if got := serveSessionKey(sc); got != "839f3b4cd5d6" {
 		t.Errorf("serveSessionKey() = %q", got)
+	}
+}
+
+// TestHelperProcess_Serve runs `crit` with the arguments after "--" for
+// TestServe_LoadsTheReviewOnlyOnceItsLockIsFree.
+func TestHelperProcess_Serve(t *testing.T) {
+	if os.Getenv("GO_TEST_HELPER") != "1" {
+		return
+	}
+	for i, arg := range os.Args {
+		if arg == "--" {
+			os.Args = append([]string{"crit"}, os.Args[i+1:]...)
+			break
+		}
+	}
+	main()
+	os.Exit(0)
+}
+
+func TestServe_LoadsTheReviewOnlyOnceItsLockIsFree(t *testing.T) {
+	testutil.SetHome(t, t.TempDir())
+	dir := t.TempDir()
+	testutil.WriteFile(t, filepath.Join(dir, "doc.md"), "# Doc\n")
+	const key = "servelock1234"
+	held, err := daemon.AcquireReviewLock(context.Background(), key)
+	if err != nil {
+		t.Fatalf("AcquireReviewLock: %v", err)
+	}
+	t.Cleanup(func() { held.Close() })
+
+	logPath := filepath.Join(t.TempDir(), "serve.log")
+	logFile, err := os.Create(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer logFile.Close()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestHelperProcess_Serve$", "--", "_serve", "--no-open", "--session-key", key, "doc.md")
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "GO_TEST_HELPER=1", "CRIT_NO_UPDATE_CHECK=1", "CRIT_NO_INTEGRATION_CHECK=1")
+	cmd.Stdout, cmd.Stderr = logFile, logFile
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	exited := make(chan struct{})
+	go func() {
+		_ = cmd.Wait()
+		close(exited)
+	}()
+	t.Cleanup(func() {
+		select {
+		case <-exited:
+		default:
+			_ = cmd.Process.Kill()
+			<-exited
+		}
+	})
+	fail := func(format string, args ...any) {
+		t.Helper()
+		out, _ := os.ReadFile(logPath)
+		t.Fatalf(format+"\ndaemon output:\n%s", append(args, out)...)
+	}
+
+	var entry daemon.SessionEntry
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(50 * time.Millisecond) {
+		if entry, err = daemon.ReadSessionFile(key); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			fail("the daemon never registered")
+		}
+	}
+	sessionStatus := func() int {
+		resp, err := http.Get(entry.ConnURL() + "/api/session")
+		if err != nil {
+			return 0
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	time.Sleep(time.Second)
+	if code := sessionStatus(); code != http.StatusServiceUnavailable {
+		fail("/api/session = %d while another process holds the review lock, want 503", code)
+	}
+
+	held.Close()
+	for deadline := time.Now().Add(10 * time.Second); sessionStatus() != http.StatusOK; time.Sleep(50 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			fail("the daemon did not load the review after the lock was released")
+		}
+	}
+
+	if got := daemon.RequestShutdown(entry); got != daemon.ShutdownAccepted {
+		fail("RequestShutdown = %v, want accepted", got)
+	}
+	select {
+	case <-exited:
+	case <-time.After(10 * time.Second):
+		fail("the daemon did not exit after the shutdown request")
 	}
 }

@@ -3,6 +3,7 @@
 package daemon
 
 import (
+	"errors"
 	"os"
 	"syscall"
 )
@@ -17,6 +18,12 @@ func FlockExclusive(f *os.File) error {
 // Returns an error immediately if another process holds the lock.
 func flockExclusiveNB(f *os.File) error {
 	return syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+}
+
+// lockHeld reports whether a flockExclusiveNB error means another process
+// holds the lock, as opposed to locking being unavailable.
+func lockHeld(err error) bool {
+	return errors.Is(err, syscall.EWOULDBLOCK)
 }
 
 // Funlock releases an advisory lock previously acquired on f.

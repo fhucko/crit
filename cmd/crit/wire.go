@@ -50,6 +50,7 @@ var (
 	writeSessionFile   = daemon.WriteSessionFile
 	writeDaemonFailure = daemon.WriteDaemonFailure
 	removeSessionFile  = daemon.RemoveSessionFile
+	acquireReviewLock  = daemon.AcquireReviewLock
 	reviewFilePath     = daemon.ReviewFilePath
 	openReadyPipe      = daemon.OpenReadyPipe
 	daemonFatal        = daemon.DaemonFatal

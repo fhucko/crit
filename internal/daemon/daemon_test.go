@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -1591,32 +1592,152 @@ func TestWaitForExit(t *testing.T) {
 	}
 }
 
-func TestUnlessSessionTakenOver(t *testing.T) {
-	const noSessionFile = 0
+func TestAcquireReviewLock_WaitsForTheHolder(t *testing.T) {
+	testutil.SetHome(t, t.TempDir())
+	held, err := AcquireReviewLock(context.Background(), "reviewlock123")
+	if err != nil {
+		t.Fatalf("AcquireReviewLock: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	if f, err := AcquireReviewLock(ctx, "reviewlock123"); err == nil {
+		f.Close()
+		t.Fatal("a second holder got the review lock while the first still held it")
+	}
+
+	got := make(chan error, 1)
+	go func() {
+		f, err := AcquireReviewLock(context.Background(), "reviewlock123")
+		if err == nil {
+			f.Close()
+		}
+		got <- err
+	}()
+	held.Close()
+	select {
+	case err := <-got:
+		if err != nil {
+			t.Fatalf("waiting holder: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the waiting holder did not get the lock after it was released")
+	}
+}
+
+func TestWithReviewLock(t *testing.T) {
 	tests := []struct {
-		name       string
-		sessionPID int
-		wantRun    bool
+		name    string
+		held    bool
+		wantRun bool
 	}{
-		{name: "no session file", sessionPID: noSessionFile, wantRun: true},
-		{name: "session file names this daemon", sessionPID: 4242, wantRun: true},
-		{name: "another daemon registered under the key", sessionPID: 4343},
+		{name: "no daemon holds the review", wantRun: true},
+		{name: "a daemon holds the review", held: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			testutil.SetHome(t, t.TempDir())
-			key := "takeover123"
-			if tt.sessionPID != noSessionFile {
-				if err := WriteSessionFile(key, SessionEntry{PID: tt.sessionPID}); err != nil {
-					t.Fatalf("WriteSessionFile: %v", err)
+			if tt.held {
+				f, err := AcquireReviewLock(context.Background(), "reviewlock123")
+				if err != nil {
+					t.Fatalf("AcquireReviewLock: %v", err)
 				}
+				t.Cleanup(func() { f.Close() })
 			}
 			ran := false
-			UnlessSessionTakenOver(key, 4242, func() { ran = true })
+			WithReviewLock("reviewlock123", 150*time.Millisecond, func() { ran = true })
 			if ran != tt.wantRun {
 				t.Errorf("ran = %v, want %v", ran, tt.wantRun)
 			}
 		})
+	}
+}
+
+func TestCleanOrphanedSessions_RemovesFreeReviewLocks(t *testing.T) {
+	tests := []struct {
+		name     string
+		held     bool
+		wantKept bool
+	}{
+		{name: "nobody holds it"},
+		{name: "a daemon still holds it", held: true, wantKept: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			testutil.SetHome(t, t.TempDir())
+			key := "reviewlock123"
+			f, err := AcquireReviewLock(context.Background(), key)
+			if err != nil {
+				t.Fatalf("AcquireReviewLock: %v", err)
+			}
+			if tt.held {
+				t.Cleanup(func() { f.Close() })
+			} else {
+				f.Close()
+			}
+
+			cleanOrphanedSessions()
+
+			path, _ := reviewLockPath(key)
+			_, statErr := os.Stat(path)
+			if kept := statErr == nil; kept != tt.wantKept {
+				t.Errorf("review lock kept = %v, want %v", kept, tt.wantKept)
+			}
+		})
+	}
+}
+
+func TestCleanOrphanedSessions_KeepsAHeldSessionLock(t *testing.T) {
+	testutil.SetHome(t, t.TempDir())
+	key := "deadsession123"
+	if err := WriteSessionFile(key, SessionEntry{PID: 999999, Port: 1}); err != nil {
+		t.Fatalf("WriteSessionFile: %v", err)
+	}
+	lock, err := acquireSessionLock(key)
+	if err != nil {
+		t.Fatalf("acquireSessionLock: %v", err)
+	}
+	t.Cleanup(func() { releaseSessionLock(lock) })
+
+	cleanOrphanedSessions()
+
+	if !isFileAt(lock, lock.Name()) {
+		t.Error("the dead session's cleanup removed a session lock that a starting client holds")
+	}
+}
+
+func TestLockFile_ReopensAFileRemovedWhileWaiting(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows cannot remove a lock file that another process has open")
+	}
+	path := filepath.Join(t.TempDir(), "x.lock")
+	first, err := lockFile(context.Background(), path)
+	if err != nil {
+		t.Fatalf("lockFile: %v", err)
+	}
+
+	got := make(chan *os.File, 1)
+	go func() {
+		f, err := lockFile(context.Background(), path)
+		if err != nil {
+			t.Errorf("waiting lockFile: %v", err)
+		}
+		got <- f
+	}()
+	time.Sleep(150 * time.Millisecond) // let the waiter open the file that is about to go
+	removeLockFile(first, path)
+
+	select {
+	case f := <-got:
+		if f == nil {
+			return
+		}
+		defer f.Close()
+		if !isFileAt(f, path) {
+			t.Error("the waiter holds the removed file instead of the one at the path")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the waiter never got the lock")
 	}
 }
 

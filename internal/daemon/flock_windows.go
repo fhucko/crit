@@ -3,6 +3,7 @@
 package daemon
 
 import (
+	"errors"
 	"os"
 
 	"golang.org/x/sys/windows"
@@ -31,6 +32,12 @@ func FlockExclusive(f *os.File) error {
 func flockExclusiveNB(f *os.File) error {
 	ol := new(windows.Overlapped)
 	return windows.LockFileEx(windows.Handle(f.Fd()), windows.LOCKFILE_EXCLUSIVE_LOCK|windows.LOCKFILE_FAIL_IMMEDIATELY, 0, lockLenLow, lockLenHigh, ol)
+}
+
+// lockHeld reports whether a flockExclusiveNB error means another process
+// holds the lock, as opposed to locking being unavailable.
+func lockHeld(err error) bool {
+	return errors.Is(err, windows.ERROR_LOCK_VIOLATION)
 }
 
 func Funlock(f *os.File) error {

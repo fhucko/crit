@@ -233,13 +233,23 @@ func runServe(args []string) {
 	srv.PrimePRListCache(ctx)
 
 	type sessionResult struct {
-		session *Session
-		err     error
+		session    *Session
+		reviewLock *os.File
+		err        error
 	}
 	ch := make(chan sessionResult, 1)
 	go func() {
+		// A daemon under the same key that is still stopping can write the
+		// review again, so it is loaded only once that daemon has let go of it.
+		lockCtx, cancelLock := context.WithTimeout(ctx, time.Minute)
+		defer cancelLock()
+		lock, err := acquireReviewLock(lockCtx, key)
+		if err != nil {
+			ch <- sessionResult{err: err}
+			return
+		}
 		s, err := server.CreateSession(sc)
-		ch <- sessionResult{s, err}
+		ch <- sessionResult{s, lock, err}
 	}()
 
 	var sess *Session
@@ -247,8 +257,20 @@ func runServe(args []string) {
 	select {
 	case res := <-ch:
 		sess, initErr = res.session, res.err
+		if res.reviewLock != nil {
+			defer res.reviewLock.Close()
+		}
 	case <-time.After(2 * time.Minute):
 		initErr = fmt.Errorf("session initialization timed out after 2 minutes")
+	}
+	if initErr != nil && ctx.Err() != nil {
+		// Stopped while it waited for the review lock. Nothing was loaded, so
+		// it goes like any stopped daemon rather than as a failed start.
+		removeSessionFile(key)
+		shutCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = httpServer.Shutdown(shutCtx)
+		return
 	}
 	if initErr != nil {
 		log.Printf("Error: %v", initErr)

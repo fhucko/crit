@@ -88,12 +88,13 @@ func installDaemonSignalHandler(pid int) {
 	}()
 }
 
-// terminateDaemonProcess, waitForDaemonExit and approvalSignalGrace are seams
-// for tests.
+// terminateDaemonProcess, waitForDaemonExit, approvalSignalGrace and
+// reviewLockWait are seams for tests.
 var (
 	terminateDaemonProcess = daemon.TerminateProcess
 	waitForDaemonExit      = daemon.WaitForExit
 	approvalSignalGrace    = 500 * time.Millisecond
+	reviewLockWait         = 2 * time.Second
 )
 
 // stopDaemonOnApproval stops the daemon once the review is approved and runs
@@ -130,11 +131,15 @@ func stopDaemonOnApproval(approved bool, entry daemon.SessionEntry, key string, 
 	if !cleanup {
 		return
 	}
-	// A stopping daemon can still write the review, and a daemon started
-	// meanwhile under the same key has loaded it, so the review goes only once
-	// the daemon has exited and nobody took the key over.
+	// A stopping daemon can still write the review, so it goes only once the
+	// daemon has exited, and not while a daemon started since has it loaded.
 	waitForDaemonExit(entry.PID)
-	daemon.UnlessSessionTakenOver(key, entry.PID, func() {
+	daemon.WithReviewLock(key, reviewLockWait, func() {
+		// An older crit started meanwhile does not take the review lock, so
+		// its session file is the only sign that it has loaded the review.
+		if file, err := daemon.ReadSessionFile(key); err == nil && file.PID != entry.PID {
+			return
+		}
 		cleanupOnApproval(approved, entry.ReviewPath, cleanup)
 	})
 }
