@@ -988,6 +988,7 @@
     btn.textContent = unresolved === 0 ? 'Approve' : 'Finish Review';
     btn.disabled = false;
     btn.classList.add('btn-primary');
+    shared.lockFinishBtnIfStopped(btn);
   }
   registerPanelRefresh(updateFinishBtn);
 
@@ -1014,6 +1015,7 @@
         btn.textContent = 'Waiting...';
         btn.disabled = true;
         btn.classList.remove('btn-primary');
+        shared.lockFinishBtnIfStopped(btn);
       }
       var edits2 = document.getElementById('waitingEdits');
       if (edits2) edits2.textContent = '';

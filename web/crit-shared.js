@@ -494,6 +494,7 @@
   async function runFinishReview(opts) {
     var o = opts || {};
     var dedup = o.dedup;
+    if (serverStopped) return null;
     if (dedup && typeof dedup.busy === 'function' && dedup.busy()) return null;
     if (dedup && typeof dedup.set === 'function') dedup.set();
     try {
@@ -501,6 +502,7 @@
         var consentOk = await o.checkConsent();
         if (!consentOk) return null;
       }
+      if (serverStopped) return null;
       var resp = await fetch('/api/finish', { method: 'POST' });
       if (!resp.ok) throw new Error('Finish review failed: HTTP ' + resp.status);
       var data = await resp.json();
@@ -958,7 +960,23 @@
     if (_tipInterval) { clearInterval(_tipInterval); _tipInterval = null; }
   }
 
+  // Set once the daemon announced server-shutdown; the page is read only from
+  // then on, so nothing may re-enable finishing.
+  var serverStopped = false;
+
+  // Shows the finish button as a disabled "Session complete" once the server
+  // has stopped. Returns true when it did, so callers skip their own label.
+  function lockFinishBtnIfStopped(btn) {
+    if (!serverStopped || !btn) return false;
+    btn.textContent = 'Session complete';
+    btn.disabled = true;
+    btn.classList.remove('btn-primary');
+    return true;
+  }
+
   function showDisconnected() {
+    serverStopped = true;
+    lockFinishBtnIfStopped(document.getElementById('finishBtn'));
     if (document.querySelector('.disconnected-banner')) return;
     var header = document.querySelector('.header');
     if (!header) return;
@@ -1112,6 +1130,7 @@
 
   function applyProjectPromptTrustUI(cfg, finishBtn) {
     if (!finishBtn || !cfg) return;
+    if (lockFinishBtnIfStopped(finishBtn)) return;
     if (cfg.project_prompts_untrusted) {
       // The trust dialog is opened by the finish button's click handler.
       // Keep the button actionable so the user can make that trust choice;
@@ -1156,6 +1175,7 @@
     computeResizeDelta,
     attachImageUploads,
     showDisconnected,
+    lockFinishBtnIfStopped,
     startTipRotation,
     stopTipRotation,
     ensureProjectPromptTrust,
