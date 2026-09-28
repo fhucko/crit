@@ -579,7 +579,7 @@
       if (approved) {
         // close_on_approve_after_ms is global-only and off by default. Prefer
         // the value baked into the /api/finish response: the daemon may stop
-        // immediately after an approved finish (killDaemonOnApproval), so a
+        // immediately after an approved finish (stopDaemonOnApproval), so a
         // separate /api/config round-trip can race and fail. Fall back to the
         // config endpoint only when the finish payload omits the field (older
         // daemon). Best-effort — a missing/failed config fetch just means no

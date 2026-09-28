@@ -100,6 +100,8 @@ type Server struct {
 	// SIGINT/SIGTERM cancels them instead of leaking. Set via
 	// SetShutdownCtx; nil in tests, in which case a background context is used.
 	shutdownCtx context.Context
+	// stopDaemon cancels shutdownCtx. Set via SetStopFunc; nil in tests.
+	stopDaemon func()
 	// bgWG tracks long-running background goroutines (e.g. agent subprocess
 	// runners) that must complete before the daemon writes the review file
 	// during shutdown. The shutdown path Wait()s on this with a timeout.
@@ -182,6 +184,7 @@ func NewServer(session *Session, frontendFS embed.FS, shareURL string, proxyAuth
 	mux.HandleFunc("/api/share-url", s.withReady(s.handleShareURL))
 	mux.HandleFunc("/api/comments/merge", s.withReady(s.handleMergeComments))
 	mux.HandleFunc("/api/finish", s.withReady(s.handleFinish))
+	mux.HandleFunc("/api/shutdown", s.handleShutdown)
 	mux.HandleFunc("/api/events", s.withReady(s.handleEvents))
 	mux.HandleFunc("/api/wait-for-event", s.withReady(s.handleWaitForEvent))
 	mux.HandleFunc("/api/round-complete", s.withReady(s.handleRoundComplete))
@@ -370,6 +373,12 @@ func (s *Server) withReady(next http.HandlerFunc) http.HandlerFunc {
 // leave it unset; effectiveCtx then falls back to context.Background().
 func (s *Server) SetShutdownCtx(ctx context.Context) {
 	s.shutdownCtx = ctx
+}
+
+// SetStopFunc wires the cancel func of the daemon's shutdown context, which
+// POST /api/shutdown calls.
+func (s *Server) SetStopFunc(stop func()) {
+	s.stopDaemon = stop
 }
 
 // effectiveCtx returns the daemon shutdown ctx if set, otherwise a background
@@ -2487,7 +2496,7 @@ func (s *Server) handleFinish(w http.ResponseWriter, r *http.Request) {
 
 	// Auto-close-after-approve delay travels with the finish payload so the
 	// browser does not need a second /api/config round-trip after approval.
-	// That round-trip races with killDaemonOnApproval, which stops the daemon
+	// That round-trip races with stopDaemonOnApproval, which stops the daemon
 	// as soon as the approved finish response has been processed.
 	finishResp := map[string]any{
 		"status":       "finished",
@@ -2582,6 +2591,38 @@ func buildCommentsListCommand(sess *Session) string {
 // endpoints, changed field meaning, or changed request shape). Additive
 // changes do not require a bump. Clients treat a missing field as version 0.
 const APIVersion = 1
+
+// handleShutdown stops the daemon the way SIGTERM does: in-flight responses
+// complete and browsers receive server-shutdown. It is readiness-gated because
+// an initialising daemon cannot act on the stop until init ends.
+func (s *Server) handleShutdown(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	// Any page script, even a same-origin preview, sends Sec-Fetch-Site or
+	// Origin; only the CLI may stop the daemon.
+	if r.Header.Get("Sec-Fetch-Site") != "" || r.Header.Get("Origin") != "" {
+		http.Error(w, "Forbidden: shutdown is CLI-only", http.StatusForbidden)
+		return
+	}
+	// The caller names the daemon it means, so a stale session entry whose
+	// port now belongs to another daemon cannot stop that one, even while it
+	// is still initialising.
+	if pid, err := strconv.Atoi(r.URL.Query().Get("pid")); err != nil || pid != os.Getpid() {
+		http.Error(w, "pid does not match this daemon", http.StatusConflict)
+		return
+	}
+	if !s.requireReady(w) {
+		return
+	}
+	if s.stopDaemon == nil {
+		http.Error(w, "shutdown not available", http.StatusServiceUnavailable)
+		return
+	}
+	writeJSON(w, map[string]any{"status": "stopping"})
+	s.stopDaemon()
+}
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {

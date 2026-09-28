@@ -160,8 +160,7 @@ func RunPlan(args []string) error {
 	}
 
 	approved := daemon.RunReviewClient(entry, key, quiet)
-	killDaemonOnApproval(approved, entry.PID)
-	cleanupOnApproval(approved, entry.ReviewPath, config.LoadConfig(cwd).CleanupOnApproveEnabled())
+	stopDaemonOnApproval(approved, entry, key, config.LoadConfig(cwd).CleanupOnApproveEnabled())
 	return nil
 }
 
@@ -312,8 +311,7 @@ func runPlanReviewHook(logPrefix, sessionID string, content []byte, emitDecision
 	}
 
 	approved, prompt := daemon.RunReviewClientRaw(entry, key)
-	killDaemonOnApproval(approved, entry.PID)
-	cleanupOnApproval(approved, entry.ReviewPath, cfg.CleanupOnApproveEnabled())
+	stopDaemonOnApproval(approved, entry, key, cfg.CleanupOnApproveEnabled())
 	emitDecision(approved, prompt)
 }
 
