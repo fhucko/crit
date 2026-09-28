@@ -7270,7 +7270,9 @@
     renderCommentsPanel();
     if (uiState === 'reviewing') {
       const openTotal = unresolved + hiddenUnresolved;
-      document.getElementById('finishBtn').textContent = openTotal === 0 ? 'Approve' : 'Finish Review';
+      const finishBtn = document.getElementById('finishBtn');
+      finishBtn.textContent = openTotal === 0 ? 'Approve' : 'Finish Review';
+      window.crit.shared.lockFinishBtnIfStopped(finishBtn);
     }
   }
 
@@ -7792,11 +7794,13 @@
         finishBtn.classList.add('btn-primary');
         document.getElementById('waitingEdits').textContent = '';
         waitingOverlay.classList.remove('active');
+        window.crit.shared.lockFinishBtnIfStopped(finishBtn);
         break;
       case 'waiting':
         finishBtn.textContent = 'Waiting...';
         finishBtn.disabled = true;
         finishBtn.classList.remove('btn-primary');
+        window.crit.shared.lockFinishBtnIfStopped(finishBtn);
         document.getElementById('waitingEdits').textContent = '';
         document.getElementById('promptCopyRow').style.display = '';
         document.getElementById('waitingDivider').style.display = '';
