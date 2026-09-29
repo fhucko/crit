@@ -357,6 +357,42 @@ func TestAcquireSessionLock_FlockBased(t *testing.T) {
 	}
 }
 
+func TestAcquireSessionLock_ReopensAFileDeletedWhileWaiting(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows cannot delete a lock file that another process has open")
+	}
+	testutil.SetHome(t, t.TempDir())
+	key := "locktest123456"
+	first, err := acquireSessionLock(key)
+	if err != nil {
+		t.Fatalf("acquireSessionLock: %v", err)
+	}
+
+	got := make(chan *os.File, 1)
+	go func() {
+		f, err := acquireSessionLock(key)
+		if err != nil {
+			t.Errorf("waiting acquireSessionLock: %v", err)
+		}
+		got <- f
+	}()
+	time.Sleep(150 * time.Millisecond) // let the waiter open the file that is about to go
+	releaseSessionLock(first)
+
+	select {
+	case f := <-got:
+		if f == nil {
+			return
+		}
+		defer releaseSessionLock(f)
+		if !isFileAt(f, f.Name()) {
+			t.Error("the waiter holds the deleted lock file instead of the one at the path")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the waiter never got the lock")
+	}
+}
+
 func TestIsDaemonAlive_NoPID(t *testing.T) {
 	if isDaemonAlive(SessionEntry{PID: 0, Port: 9999}) {
 		t.Error("PID 0 should not be alive")

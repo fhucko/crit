@@ -583,7 +583,16 @@ func acquireSessionLock(key string) (*os.File, error) {
 	for time.Now().Before(deadline) {
 		err = flockExclusiveNB(f)
 		if err == nil {
-			return f, nil
+			if isFileAt(f, lockPath) {
+				return f, nil
+			}
+			// The holder deleted the file while this process waited on it,
+			// and a lock on a deleted file excludes nobody.
+			f.Close()
+			if f, err = os.OpenFile(lockPath, os.O_CREATE|os.O_WRONLY, 0644); err != nil {
+				return nil, err
+			}
+			continue
 		}
 		time.Sleep(backoff)
 		if backoff < 500*time.Millisecond {
@@ -594,12 +603,19 @@ func acquireSessionLock(key string) (*os.File, error) {
 	return nil, fmt.Errorf("could not acquire session lock for %s", key)
 }
 
+// isFileAt reports whether f is still the file at path.
+func isFileAt(f *os.File, path string) bool {
+	held, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	current, err := os.Stat(path)
+	return err == nil && os.SameFile(held, current)
+}
+
 // releaseSessionLock unlocks, closes, and removes the lock file.
 func releaseSessionLock(f *os.File) {
-	_ = Funlock(f)
-	name := f.Name()
-	f.Close()
-	os.Remove(name)
+	unlockAndRemove(f)
 }
 
 // setupDaemonCmd creates and configures the daemon child process.
