@@ -393,6 +393,25 @@ func TestAcquireSessionLock_ReopensAFileDeletedWhileWaiting(t *testing.T) {
 	}
 }
 
+func TestCleanOrphanedSessions_KeepsAHeldSessionLock(t *testing.T) {
+	testutil.SetHome(t, t.TempDir())
+	key := "deadsession123"
+	if err := WriteSessionFile(key, SessionEntry{PID: 999999, Port: 1}); err != nil {
+		t.Fatalf("WriteSessionFile: %v", err)
+	}
+	lock, err := acquireSessionLock(key)
+	if err != nil {
+		t.Fatalf("acquireSessionLock: %v", err)
+	}
+	t.Cleanup(func() { releaseSessionLock(lock) })
+
+	cleanOrphanedSessions()
+
+	if !isFileAt(lock, lock.Name()) {
+		t.Error("the dead session's cleanup deleted a session lock that a starting client holds")
+	}
+}
+
 func TestIsDaemonAlive_NoPID(t *testing.T) {
 	if isDaemonAlive(SessionEntry{PID: 0, Port: 9999}) {
 		t.Error("PID 0 should not be alive")

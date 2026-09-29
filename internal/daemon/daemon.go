@@ -618,6 +618,20 @@ func releaseSessionLock(f *os.File) {
 	unlockAndRemove(f)
 }
 
+// removeLockIfFree deletes the lock file at path unless another process
+// holds it.
+func removeLockIfFree(path string) {
+	f, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if err != nil {
+		return
+	}
+	if flockExclusiveNB(f) != nil {
+		f.Close()
+		return
+	}
+	unlockAndRemove(f)
+}
+
 // setupDaemonCmd creates and configures the daemon child process.
 // Returns the command, readiness pipe read-end, write-end, log file, and any error.
 // The caller must close writeEnd and logFile after Start().
@@ -1003,7 +1017,7 @@ func cleanOrphanedSessions() {
 			os.Remove(path)
 			key := strings.TrimSuffix(de.Name(), ".json")
 			os.Remove(filepath.Join(sessDir, key+".log"))
-			os.Remove(filepath.Join(sessDir, key+".lock"))
+			removeLockIfFree(filepath.Join(sessDir, key+".lock"))
 		}
 	}
 }
