@@ -152,7 +152,7 @@ test.describe('Approve Button after server shutdown', () => {
 
     // Unresolving recounts the comments, which relabels the finish button.
     await switchToDocumentView(page);
-    const section = mdSection(page);
+    const section = await mdSection(page);
     await section.locator('.comment-collapse-btn').click();
     await section.locator('.comment-card').hover();
     await section.locator('.comment-actions button[title="Unresolve"]').click();
