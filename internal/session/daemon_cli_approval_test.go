@@ -23,6 +23,7 @@ func TestStopDaemonOnApproval(t *testing.T) {
 		shutdownCode        int // HTTP status the daemon answers /api/shutdown with
 		sessionPID          int
 		successorDuringWait bool // a daemon registers under the key while this one exits
+		exitUnconfirmed     bool
 		wantRequest         bool
 		wantSignal          bool
 		wantWaited          bool
@@ -30,6 +31,7 @@ func TestStopDaemonOnApproval(t *testing.T) {
 	}{
 		{name: "not approved", approved: false, cleanup: true, shutdownCode: http.StatusOK, sessionPID: os.Getpid()},
 		{name: "daemon accepts", approved: true, cleanup: true, shutdownCode: http.StatusOK, sessionPID: os.Getpid(), wantRequest: true, wantWaited: true, wantRemoved: true},
+		{name: "daemon survives forced kill", approved: true, cleanup: true, shutdownCode: http.StatusOK, sessionPID: os.Getpid(), exitUnconfirmed: true, wantRequest: true, wantWaited: true},
 		{name: "daemon accepts, cleanup_on_approve off", approved: true, shutdownCode: http.StatusOK, sessionPID: os.Getpid(), wantRequest: true},
 		{name: "successor registers while the daemon exits", approved: true, cleanup: true, shutdownCode: http.StatusOK, sessionPID: os.Getpid(), successorDuringWait: true, wantRequest: true, wantWaited: true},
 		{name: "another daemon on the port", approved: true, cleanup: true, shutdownCode: http.StatusConflict, sessionPID: os.Getpid(), wantRequest: true},
@@ -77,7 +79,7 @@ func TestStopDaemonOnApproval(t *testing.T) {
 			signalled, waited := false, false
 			origTerminate, origWait, origGrace := terminateDaemonProcess, waitForDaemonExit, approvalSignalGrace
 			terminateDaemonProcess = func(*os.Process) error { signalled = true; return nil }
-			waitForDaemonExit = func(int) {
+			waitForDaemonExit = func(int) bool {
 				waited = true
 				if _, err := os.Stat(reviewPath); err != nil {
 					t.Error("the review was removed before the daemon exited")
@@ -85,6 +87,7 @@ func TestStopDaemonOnApproval(t *testing.T) {
 				if tt.successorDuringWait {
 					writeSession(os.Getpid() + 1)
 				}
+				return !tt.exitUnconfirmed
 			}
 			approvalSignalGrace = 0
 			t.Cleanup(func() {

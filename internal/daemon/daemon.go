@@ -968,18 +968,25 @@ func RequestShutdown(s SessionEntry) ShutdownResult {
 }
 
 // WaitForExit waits for the process to exit and kills it if it is still alive
-// after stopWait, so the daemon's files can be removed with no late write
-// recreating them.
-func WaitForExit(pid int) {
+// after stopWait. It reports whether the process is gone, so callers do not
+// remove files that a surviving daemon may write again.
+func WaitForExit(pid int) bool {
 	proc, err := os.FindProcess(pid)
 	if err != nil {
-		return
+		// On Windows FindProcess opens a process handle and can fail when the
+		// daemon has already exited. Probe the PID to distinguish that from
+		// access being denied to a process that is still running.
+		return !procExists(&os.Process{Pid: pid})
 	}
-	if !waitForExit(proc, stopWait) && killProc(proc) == nil {
-		// A kill is asynchronous on Windows, and the daemon's files stay open
-		// until it is gone.
-		waitForExit(proc, stopWait)
+	if waitForExit(proc, stopWait) {
+		return true
 	}
+	if err := killProc(proc); err != nil {
+		return terminationProvesGone(err)
+	}
+	// A kill is asynchronous on Windows, and the daemon's files stay open
+	// until it is gone.
+	return waitForExit(proc, stopWait)
 }
 
 // SessionOwnedBy reports whether key's session file still names the daemon
@@ -1057,8 +1064,12 @@ func StopDaemon(key string) error {
 	}
 
 	if !waitForExit(proc, stopWait) {
-		if err := killProc(proc); err != nil && !terminationProvesGone(err) {
-			return fmt.Errorf("could not stop daemon %s (pid %d): %w; session file kept so you can retry", key, entry.PID, err)
+		if err := killProc(proc); err != nil {
+			if !terminationProvesGone(err) {
+				return fmt.Errorf("could not stop daemon %s (pid %d): %w; session file kept so you can retry", key, entry.PID, err)
+			}
+		} else if !waitForExit(proc, stopWait) {
+			return fmt.Errorf("could not confirm daemon %s (pid %d) exited after kill; session file kept so you can retry", key, entry.PID)
 		}
 	}
 	// A daemon that stopped gracefully removed its own file, and a successor

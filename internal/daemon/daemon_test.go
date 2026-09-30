@@ -1580,7 +1580,9 @@ func TestWaitForExit(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			proc := stubStopSignals(t, tt.hangs)
-			WaitForExit(os.Getpid())
+			if !WaitForExit(os.Getpid()) {
+				t.Error("WaitForExit did not confirm daemon exit")
+			}
 			if proc.killed != tt.wantKill {
 				t.Errorf("killed = %v, want %v", proc.killed, tt.wantKill)
 			}
@@ -1588,6 +1590,46 @@ func TestWaitForExit(t *testing.T) {
 				t.Error("WaitForExit returned before the killed daemon was gone")
 			}
 		})
+	}
+}
+
+func TestWaitForExit_DoesNotConfirmSurvivingProcess(t *testing.T) {
+	tests := []struct {
+		name    string
+		killErr error
+	}{
+		{name: "kill denied", killErr: syscall.EPERM},
+		{name: "kill accepted but process survives"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stubStopSignals(t, true)
+			killProc = func(*os.Process) error { return tt.killErr }
+			procExists = func(*os.Process) bool { return true }
+			if WaitForExit(os.Getpid()) {
+				t.Error("WaitForExit confirmed exit while process was still alive")
+			}
+		})
+	}
+}
+
+func TestStopDaemon_KeepsSessionFileWhenKillDoesNotFinish(t *testing.T) {
+	key := startFakeDaemonSession(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/shutdown" {
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "stopping"})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+	stubStopSignals(t, true)
+	procExists = func(*os.Process) bool { return true }
+
+	if err := StopDaemon(key); err == nil {
+		t.Fatal("expected an error when the daemon survives the forced kill")
+	}
+	path, _ := sessionFilePath(key)
+	if _, err := os.Stat(path); err != nil {
+		t.Errorf("session entry removed before the daemon exited: %v", err)
 	}
 }
 
@@ -1765,12 +1807,18 @@ func TestStopDaemon_RemovesSessionFileAfterKill(t *testing.T) {
 			terminateProc = func(proc *os.Process) error { return nil }
 			t.Cleanup(func() { terminateProc = origTerminate })
 
+			killed := false
 			origExists := procExists
-			procExists = func(proc *os.Process) bool { return true }
+			procExists = func(proc *os.Process) bool { return !killed }
 			t.Cleanup(func() { procExists = origExists })
 
 			origKill := killProc
-			killProc = func(proc *os.Process) error { return tt.killErr }
+			killProc = func(proc *os.Process) error {
+				if tt.killErr == nil {
+					killed = true
+				}
+				return tt.killErr
+			}
 			t.Cleanup(func() { killProc = origKill })
 
 			if err := StopDaemon(key); err != nil {

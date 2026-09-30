@@ -133,7 +133,9 @@ func stopDaemonOnApproval(approved bool, entry daemon.SessionEntry, key string, 
 	// A stopping daemon can still write the review, and a daemon started
 	// meanwhile under the same key has loaded it, so the review goes only once
 	// the daemon has exited and nobody took the key over.
-	waitForDaemonExit(entry.PID)
+	if !waitForDaemonExit(entry.PID) {
+		return
+	}
 	daemon.UnlessSessionTakenOver(key, entry.PID, func() {
 		cleanupOnApproval(approved, entry.ReviewPath, cleanup)
 	})
