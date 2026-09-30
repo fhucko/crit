@@ -457,6 +457,18 @@ func TestRemoveOpenedLockIfFree_KeepsReplacement(t *testing.T) {
 	}
 }
 
+func TestIsFileAt_ClosedLock(t *testing.T) {
+	testutil.SetHome(t, t.TempDir())
+	lock, err := acquireSessionLock("closedlock123")
+	if err != nil {
+		t.Fatalf("acquireSessionLock: %v", err)
+	}
+	releaseSessionLock(lock)
+	if isFileAt(lock, lock.Name()) {
+		t.Fatal("closed lock file cannot still protect its path")
+	}
+}
+
 func TestIsDaemonAlive_NoPID(t *testing.T) {
 	if isDaemonAlive(SessionEntry{PID: 0, Port: 9999}) {
 		t.Error("PID 0 should not be alive")
