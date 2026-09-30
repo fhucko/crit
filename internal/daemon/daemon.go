@@ -283,17 +283,18 @@ func ReadSessionFile(key string) (SessionEntry, error) {
 	return entry, nil
 }
 
-// RemoveSessionFile deletes a session file and its associated log and lock files.
+// RemoveSessionFile deletes a session file and its log, and deletes the lock
+// file only when no client holds it.
 func RemoveSessionFile(key string) {
 	path, err := sessionFilePath(key)
 	if err != nil {
 		return
 	}
 	os.Remove(path)
-	// Clean up associated log and lock files
+	// Keep a held lock in place: startup calls this after acquiring that lock.
 	dir := filepath.Dir(path)
 	os.Remove(filepath.Join(dir, key+".log"))
-	os.Remove(filepath.Join(dir, key+".lock"))
+	removeLockIfFree(filepath.Join(dir, key+".lock"))
 }
 
 // FindAliveSession looks up a session by key and returns it if alive.
@@ -625,7 +626,20 @@ func removeLockIfFree(path string) {
 	if err != nil {
 		return
 	}
+	removeOpenedLockIfFree(f, path)
+}
+
+// removeOpenedLockIfFree also checks whether the file was replaced after it
+// was opened, before deleting the path.
+func removeOpenedLockIfFree(f *os.File, path string) {
 	if flockExclusiveNB(f) != nil {
+		f.Close()
+		return
+	}
+	// The file may have been replaced after OpenFile but before the lock was
+	// acquired. Never remove a newer session's lock by its pathname.
+	if !isFileAt(f, path) {
+		_ = Funlock(f)
 		f.Close()
 		return
 	}
